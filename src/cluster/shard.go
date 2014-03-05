@@ -59,12 +59,12 @@ type ShardData struct {
 	servers         []wal.Server
 	clusterServers  []*ClusterServer
 	store           LocalShardStore
-	localShard      LocalShardDb
 	serverIds       []uint32
 	shardType       ShardType
 	durationIsSplit bool
 	shardDuration   time.Duration
 	localServerId   uint32
+	IsLocal         bool
 }
 
 func NewShard(id uint32, startTime, endTime time.Time, shardType ShardType, durationIsSplit bool, wal WAL) *ShardData {
@@ -105,6 +105,7 @@ type LocalShardStore interface {
 	SetWriteBuffer(writeBuffer *WriteBuffer)
 	BufferWrite(request *protocol.Request)
 	GetOrCreateShard(id uint32) (LocalShardDb, error)
+	ReturnShard(id uint32)
 	DeleteShard(shardId uint32) error
 }
 
@@ -140,17 +141,15 @@ func (self *ShardData) SetLocalStore(store LocalShardStore, localServerId uint32
 	self.sortServerIds()
 
 	self.store = store
-	shard, err := self.store.GetOrCreateShard(self.id)
+	// make sure we can open up the shard
+	_, err := self.store.GetOrCreateShard(self.id)
 	if err != nil {
 		return err
 	}
-	self.localShard = shard
+	self.store.ReturnShard(self.id)
+	self.IsLocal = true
 
 	return nil
-}
-
-func (self *ShardData) IsLocal() bool {
-	return self.store != nil
 }
 
 func (self *ShardData) ServerIds() []uint32 {
@@ -194,7 +193,7 @@ func (self *ShardData) Query(querySpec *parser.QuerySpec, response chan *protoco
 		}
 	}
 
-	if self.localShard != nil {
+	if self.IsLocal {
 		var processor QueryProcessor
 		if querySpec.IsListSeriesQuery() {
 			processor = engine.NewListSeriesEngine(response)
@@ -209,7 +208,12 @@ func (self *ShardData) Query(querySpec *parser.QuerySpec, response chan *protoco
 				processor = engine.NewPassthroughEngine(response, maxPointsToBufferBeforeSending)
 			}
 		}
-		err := self.localShard.Query(querySpec, processor)
+		shard, err := self.store.GetOrCreateShard(self.id)
+		if err != nil {
+			return err
+		}
+		defer self.store.ReturnShard(self.id)
+		shard.Query(querySpec, processor)
 		processor.Close()
 		return err
 	}
@@ -235,8 +239,11 @@ func (self *ShardData) Query(querySpec *parser.QuerySpec, response chan *protoco
 }
 
 func (self *ShardData) DropDatabase(database string, sendToServers bool) {
-	if self.localShard != nil {
-		self.localShard.DropDatabase(database)
+	if self.IsLocal {
+		if shard, err := self.store.GetOrCreateShard(self.id); err == nil {
+			defer self.store.ReturnShard(self.id)
+			shard.DropDatabase(database)
+		}
 	}
 
 	if !sendToServers {
@@ -262,7 +269,7 @@ func (self *ShardData) String() string {
 		serversString = append(serversString, fmt.Sprintf("%d", s.GetId()))
 	}
 	local := "false"
-	if self.localShard != nil {
+	if self.IsLocal {
 		local = "true"
 	}
 
@@ -303,13 +310,18 @@ func (self *ShardData) LogAndHandleDestructiveQuery(querySpec *parser.QuerySpec,
 		return err
 	}
 	var localResponses chan *protocol.Response
-	if self.localShard != nil {
+	if self.IsLocal {
 		localResponses = make(chan *protocol.Response, 1)
 
 		// this doesn't really apply at this point since destructive queries don't output anything, but it may later
 		maxPointsFromDestructiveQuery := 1000
 		processor := engine.NewPassthroughEngine(localResponses, maxPointsFromDestructiveQuery)
-		err := self.localShard.Query(querySpec, processor)
+		shard, err := self.store.GetOrCreateShard(self.id)
+		if err != nil {
+			return err
+		}
+		defer self.store.ReturnShard(self.id)
+		err = shard.Query(querySpec, processor)
 		processor.Close()
 		if err != nil {
 			return err
